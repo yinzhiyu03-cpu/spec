@@ -1,0 +1,379 @@
+# LeanMind AI - 软件技术规格说明书（SPEC）V1.2
+
+> 基于《LeanMind AI 产品需求文档（PRD）》V8.0 - 去角色化重排版。
+>
+> 目标：将产品需求转化为可实现、可测试、可交接的 MVP 技术规范。
+
+## 0. 版本与范围
+
+- **版本**：V1.2 - PRD V8 去角色化对齐版
+- **P0**：F-01 创意生成、F-02 局部微调、F-03 AI 商业压力测试
+- **P1**：F-04 竞品扫描与差异化建议
+- **明确不做**：角色设定、角色图片、人物插画、主题剧情、账号、支付、复杂 RAG、生产级爬虫。
+- **可选后续项**：浅色/深色主题仅可作为前端 UI 偏好；不得进入 AI prompt、API 业务逻辑或数据库业务状态。
+
+### 技术栈硬约束（写代码前必须写进 Prompt）
+
+| 层 | 固定选型 | 禁止替换 |
+|---|---|---|
+| 前端 | **Next.js** | Vue、React SPA、小程序 |
+| 后端智能体 | **Agno**（Agent + Skill + Tool，内部调用） | LangChain、AgentOS、自写 prompt 堆 |
+| 数据库 | **SQLite** | PostgreSQL、MongoDB、Redis 缓存层 |
+
+> 用 AI 写代码时，先把这三条写进需求，否则它会自动加 Redis、向量库、微服务等你自己都讲不清的东西。
+
+### 架构简化原则
+
+1. **三层就够**：Next.js → Agno 后端 → SQLite，不多加中间层。
+2. **一个入口**：前端只调 `/v1/*`，不直连大模型、不直连数据库。
+3. **能力靠 Skill，动作靠 Tool**：改 prompt 改 `skills/`，改读写改 `tools/`，不要在 orchestrator 里堆逻辑。
+4. **能 mock 就 mock**：竞品搜索、复杂 RAG 一律 mock，标注 `source=mock`。
+5. **讲不清的就不做**：每加一个组件，要能用一句话说清「谁调谁、数据存哪」。
+
+## 1. 架构
+
+```text
+Browser (Next.js)
+  -> FastAPI REST / SSE (/v1/*)
+     -> Orchestrator
+     -> Agno Agent (LocalSkills + Tools)
+     -> LLM (DeepSeek / Qwen)
+     -> SQLite（业务库 + agno_sessions.db）
+```
+
+推荐技术栈：
+
+- Frontend：Next.js App Router + TypeScript + TailwindCSS
+- Backend：**FastAPI** + Pydantic + SQLAlchemy
+- Agent：**Agno Agent** + **LocalSkills**（`skills/*/SKILL.md`）+ Python Tools（内部调用，不用 AgentOS）
+- Database：SQLite
+- Model：`agno.models.deepseek` / `agno.models.dashscope`，通过环境变量配置
+- Search：可插拔 `SearchProvider`；未配置时返回 `source=mock`
+
+关键边界：前端不得直接调用大模型或数据库；模型调用、schema 校验与版本写入全部经过后端。
+
+## 2. 数据库设计
+
+### 2.1 存储概览
+
+本项目使用 **SQLite**，分两个库文件，职责分离：
+
+| 库文件 | 路径 | 用途 |
+|--------|------|------|
+| `leanmind.db` | `backend/data/leanmind.db` | 业务数据（项目、画布、评审、竞品） |
+| `agno_sessions.db` | `backend/data/agno_sessions.db` | Agno Agent 对话记忆（框架自动管理） |
+
+ORM：`SQLAlchemy 2.x`，模型定义见 `backend/app/models.py`，启动时 `init_db()` 自动建表。
+
+### 2.2 ER 关系
+
+```text
+projects (1) ──< canvas_versions
+         ├──< conversation_messages
+         ├──< review_sessions (1) ──< review_rounds
+         └──< competitor_scans
+```
+
+### 2.3 表结构
+
+#### `projects` — 项目根表
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| title | VARCHAR(200) | | 项目标题，可选 |
+| raw_idea | TEXT | | 用户原始创业想法（10-500 字） |
+| status | VARCHAR(32) | | `empty` / `generating` / `editable` / `error` 等 |
+| current_canvas_version | INTEGER | default 0 | 当前最新画布版本号 |
+| created_at | DATETIME(TZ) | | 创建时间 UTC |
+
+#### `canvas_versions` — 画布版本快照
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| project_id | VARCHAR(36) | FK → projects.id, INDEX | 所属项目 |
+| version | INTEGER | | 版本号，从 1 递增 |
+| blocks_json | TEXT | | 九宫格 JSON（见下方结构） |
+| source | VARCHAR(32) | | `generate` / `refine` / `suggestion` |
+| change_summary | TEXT | | 变更摘要 |
+| created_at | DATETIME(TZ) | | 创建时间 UTC |
+
+`blocks_json` 结构：
+
+```json
+{
+  "problem": "…",
+  "customer_segments": "…",
+  "unique_value_proposition": "…",
+  "solution": "…",
+  "channels": "…",
+  "revenue_streams": "…",
+  "cost_structure": "…",
+  "key_metrics": "…",
+  "unfair_advantage": "…"
+}
+```
+
+#### `conversation_messages` — 微调对话记录
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| project_id | VARCHAR(36) | FK → projects.id, INDEX | 所属项目 |
+| role | VARCHAR(16) | | `user` / `assistant` |
+| content | TEXT | | 用户指令或 AI 解释 |
+| target_block | VARCHAR(64) | NULL | 目标模块 key，如 `revenue_streams` |
+| status | VARCHAR(32) | default `ok` | 消息状态 |
+| created_at | DATETIME(TZ) | | 创建时间 UTC |
+
+#### `review_sessions` — 商业压力测试会话
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| project_id | VARCHAR(36) | FK → projects.id, INDEX | 所属项目 |
+| focus | TEXT | | 评审聚焦点，可选 |
+| status | VARCHAR(32) | default `active` | `active` / `completed` |
+| current_round | INTEGER | default 1 | 当前轮次（1-3） |
+| report_json | TEXT | NULL | 完成后写入评审报告 JSON |
+| created_at | DATETIME(TZ) | | 创建时间 UTC |
+
+`report_json` 结构：
+
+```json
+{
+  "riskItems": [{"title": "…", "level": "high|medium|low", "detail": "…"}],
+  "existingEvidence": ["…"],
+  "nextValidationActions": ["…"],
+  "suggestedPatches": [{"suggestionId": "…", "blockKey": "…", "content": "…", "reason": "…"}]
+}
+```
+
+#### `review_rounds` — 评审每轮问答
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| session_id | VARCHAR(36) | FK → review_sessions.id, INDEX | 所属会话 |
+| round_no | INTEGER | | 轮次 1 / 2 / 3 |
+| question | TEXT | | AI 追问 |
+| answer | TEXT | NULL | 用户回答 |
+| risk_tag | VARCHAR(16) | NULL | 风险标签 |
+
+#### `competitor_scans` — 竞品扫描记录
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| id | VARCHAR(36) | PK | UUID |
+| project_id | VARCHAR(36) | FK → projects.id, INDEX | 所属项目 |
+| query | TEXT | | 扫描查询词 |
+| source | VARCHAR(16) | default `mock` | `web` 或 `mock` |
+| status | VARCHAR(32) | default `done` | 扫描状态 |
+| matrix_json | TEXT | default `{}` | 竞品矩阵 JSON |
+| created_at | DATETIME(TZ) | | 创建时间 UTC |
+
+`matrix_json` 数组元素：
+
+```json
+{"name": "竞品名", "segment": "目标用户", "strengths": ["…"], "limitations": ["…"]}
+```
+
+### 2.4 画布模块枚举（CanvasBlockKey）
+
+```text
+problem | customer_segments | unique_value_proposition |
+solution | channels | revenue_streams |
+cost_structure | key_metrics | unfair_advantage
+```
+
+### 2.5 版本与写入规则
+
+- 首次完整生成 → 写入 `canvas_versions` v1，`source=generate`
+- 局部微调成功 → 新建版本，`source=refine`
+- 用户确认应用评审建议 → 新建版本，`source=suggestion`
+- 无效输入、超时、JSON 校验失败、未确认建议 → **不写版本**
+- 评审建议的 `suggestionId` 当前存于后端内存（演示用），生产可迁入 `report_json` 或独立表
+
+### 2.6 代码对应
+
+| SPEC 表 | 代码位置 |
+|---------|----------|
+| 全部 ORM 模型 | `backend/app/models.py` |
+| 建表 / 连接 | `backend/app/database.py` |
+| 读写 Tool | `backend/app/tools/canvas_db.py` |
+| Agno 会话库 | `backend/app/config.py` → `AGNO_DB` |
+
+## 3. API
+
+| Method | Path | 请求 | 返回 |
+|---|---|---|---|
+| POST | `/v1/projects` | title?, rawIdea | Project |
+| GET | `/v1/projects/{id}` | - | Project + latest CanvasVersion |
+| POST | `/v1/projects/{id}/generate` | industry?, audience? | SSE |
+| POST | `/v1/projects/{id}/refine` | instruction, targetHint?, refineMode? | RefineResult |
+| POST | `/v1/projects/{id}/review-sessions` | focus? | ReviewSession + round 1 |
+| POST | `/v1/review-sessions/{id}/answers` | answer | next question / ReviewReport |
+| POST | `/v1/projects/{id}/competitor-scans` | query? | CompetitorScan |
+| POST | `/v1/projects/{id}/suggestions/apply` | suggestionId, targetBlock | new CanvasVersion |
+
+### SSE events
+
+```text
+generation_started {projectId}
+block_delta {blockKey, delta}
+block_completed {blockKey, content}
+generation_completed {canvasVersion, status:"editable"}
+error {code, message}
+```
+
+## 4. AI 结构化输出
+
+### CanvasAgent
+
+输入：`rawIdea, industry?, audience?`。
+
+输出必须为 9 个 CanvasBlockKey；每格 `content` 约 30-120 个中文字符。未知信息使用“待验证假设”表达，不得编造成已验证事实；不输出 Markdown。
+
+### RefineAgent
+
+输入：当前完整画布、`instruction`、`targetHint?`、`refineMode`（`single` | `multi` | `full`）。
+
+输出：`refineMode, targetBlock, patches, relatedSuggestions, explanation, needsClarification`。
+
+| refineMode | 行为 | patches |
+|------------|------|---------|
+| `single`（默认） | 只改一格 | 1 条 |
+| `multi` | 多格联动 | 2–8 条 |
+| `full` | 整体重写 | **必须 9 条**（全部 blockKey） |
+
+**blockKey 与正文（content）的区别**（详见 `skills/canvas-refine/references/BLOCKS.md`）：
+
+| 概念 | 说明 | 示例 |
+|------|------|------|
+| blockKey | JSON/代码用的英文 key | `revenue_streams` |
+| 中文名称 | 界面显示标签 | 「收入来源」 |
+| content | 写入 `blocks_json` 的格子正文 | 「学生会员 29 元/月」 |
+| SKILL.md | AI 方法论文档 | **不是** content |
+
+- 无法定位时返回 `needsClarification=true`，不得返回 patch。
+- `relatedSuggestions` 仅建议，不自动写入（`multi`/`full` 时可直接写入 patches）。
+
+```json
+{
+  "refineMode": "multi",
+  "targetBlock": "revenue_streams",
+  "patches": [
+    {"blockKey": "revenue_streams", "content": "学生会员订阅 29 元/月"},
+    {"blockKey": "cost_structure", "content": "会员运营 + 客服 + 云服务器"}
+  ],
+  "relatedSuggestions": [],
+  "needsClarification": false
+}
+```
+
+### ReviewAgent
+
+统一、专业的 AI 商业评审助手；不包含角色、人设、人物图片或角色化话术。
+
+维度：
+- 需求与用户
+- 价值与差异化
+- 盈利与成本
+- 渠道与竞争
+
+规则：共 3 轮问答，完成后输出 `riskItems, existingEvidence, nextValidationActions, suggestedPatches`。每个风险标注 `high/medium/low`。
+
+### CompetitorAgent
+
+真实搜索可用时：返回 `name, segment, strengths, limitations, sourceUrl, confidence`。
+
+搜索未配置时：返回 `source="mock"`，前端必须显示“演示数据，未联网检索”；不允许伪造真实竞品或来源。
+
+### 模型输出总规则
+
+- 所有输出先 Pydantic 校验，再写入 SQLite。
+- JSON 失败时可自动修复一次。
+- 第二次失败返回 `LLM_SCHEMA_INVALID`，不写库。
+
+## 5. 页面组件与状态机
+
+组件：`IdeaInputPanel`、`CanvasGrid`、`CanvasCard`、`ChatRefinePanel`、`ReviewPanel`、`CompetitorDrawer`、`Toast/StatusBar`。
+
+```text
+empty -> generating -> editable
+editable -> refining -> editable
+editable -> reviewing -> editable
+editable -> scanning -> result_open -> editable
+any transient state -> error -> previous_stable_state
+```
+
+- 生成中：九宫格逐步补全，微调入口禁用。
+- 微调中：已修改的格子高亮（支持多格）；`full` 模式九宫格全部更新。
+- 评审中：九宫格只读；完成或退出后恢复编辑。
+- 竞品扫描中：结果抽屉须显示 `source=web` 或 `source=mock`。
+
+## 6. 异常处理
+
+| 场景 | 后端 | 前端 |
+|---|---|---|
+| 输入不合法 | 400，不建项目 | 请输入 10-500 字创业想法 |
+| 15 秒无 SSE 首包 | 关闭流，记录日志 | 模型响应超时，请重试 |
+| 45 秒未完成 | 不保存半成品 | 生成未完成，已保留原始想法 |
+| JSON 校验失败 | 修复 1 次，否则 502 | AI 返回格式异常，请重试 |
+| 微调目标不明确 | clarification，不写库 | 请说明要修改哪一格 |
+| 无 Search Key | 返回 mock | 当前展示演示数据，未联网检索 |
+| 数据库写入失败 | 回滚事务 | 保存失败，请重试 |
+
+## 7. 环境变量与运行
+
+```bash
+# backend/.env
+LLM_BASE_URL=https://<provider>/v1
+LLM_API_KEY=your_key
+LLM_MODEL=your_model_name
+DATABASE_URL=sqlite:///./data/leanmind.db
+SEARCH_API_KEY=
+CORS_ORIGINS=http://localhost:3000
+
+# frontend/.env.local
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+```
+
+```bash
+# frontend
+cd frontend && npm install && npm run dev
+
+# backend
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+## 8. 验收标准
+
+- AC-01：10-500 字可创建项目；不足 10 字不调后端。
+- AC-02：九宫格 9 格完整返回；保存 v1。
+- AC-03：自然语言能修改目标模块；版本号递增。
+- AC-04：生成、高亮、锁定、错误、恢复状态可观察。
+- AC-05：可完成 3 轮商业评审，获得风险、依据、验证动作。
+- AC-06：竞品矩阵来源明确；至少一条建议可写回画布。
+- AC-07：刷新后恢复最新画布。
+
+## 9. Coding Agent 实施指令
+
+```text
+根据《LeanMind AI 软件技术规格说明书（SPEC）V1.2》实现可本地运行的 monorepo。
+
+技术栈：Next.js App Router + TypeScript + TailwindCSS；**FastAPI** + Pydantic + SQLAlchemy + SQLite；**Agno**（内部 Agent，不用 AgentOS）。
+
+Agno 集成要求：4 个业务 Agent 各绑定一个 `LocalSkills`；工具函数注册为 Agent Tools；会话记忆使用 `SqliteDb`；由 FastAPI Orchestrator 调用 Agent，不挂载 AgentOS。
+
+优先完成：创建项目、SSE 九宫格生成、自然语言局部微调与版本保存、刷新恢复。之后完成统一 AI 商业压力测试（3 轮）和竞品扫描 mock fallback。
+
+强制规则：API Key 只在后端；所有 LLM 结果 Pydantic 校验；JSON 失败最多修复一次；mock 数据必须标记；不实现角色、人物图片、主题剧情、账号、支付、复杂 RAG、PDF 导出或生产级爬虫。
+
+交付：README、.env.example、数据库初始化、启动命令、至少一组 mock 数据和基础 API 测试。
+```
