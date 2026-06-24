@@ -1,0 +1,206 @@
+# LeanMind AI - 软件技术规格说明书（SPEC）V1.2
+
+> 基于《LeanMind AI 产品需求文档（PRD）》V8.0 - 去角色化重排版。
+>
+> 目标：将产品需求转化为可实现、可测试、可交接的 MVP 技术规范。
+
+## 0. 版本与范围
+
+- **版本**：V1.2 - PRD V8 去角色化对齐版
+- **P0**：F-01 创意生成、F-02 局部微调、F-03 AI 商业压力测试
+- **P1**：F-04 竞品扫描与差异化建议
+- **明确不做**：角色设定、角色图片、人物插画、主题剧情、账号、支付、复杂 RAG、生产级爬虫。
+- **可选后续项**：浅色/深色主题仅可作为前端 UI 偏好；不得进入 AI prompt、API 业务逻辑或数据库业务状态。
+
+## 1. 架构
+
+```text
+Browser (Next.js)
+  -> FastAPI REST / SSE
+     -> LLM Service (Canvas / Refine / Review / Competitor)
+     -> Optional SearchProvider
+     -> SQLite
+```
+
+推荐技术栈：
+
+- Frontend：Next.js App Router + TypeScript + TailwindCSS
+- Backend：FastAPI + Pydantic + SQLAlchemy
+- Database：SQLite
+- Model：OpenAI-compatible client，通过环境变量配置
+- Search：可插拔 `SearchProvider`；未配置时返回 `source=mock`
+
+关键边界：前端不得直接调用大模型或数据库；模型调用、schema 校验与版本写入全部经过后端。
+
+## 2. 数据模型
+
+```text
+CanvasBlockKey =
+problem | customer_segments | unique_value_proposition |
+solution | channels | revenue_streams |
+cost_structure | key_metrics | unfair_advantage
+```
+
+| 实体 | 字段 | 说明 |
+|---|---|---|
+| Project | id, title, raw_idea, status, current_canvas_version, created_at | 项目根实体 |
+| CanvasVersion | id, project_id, version, blocks_json, source, change_summary, created_at | 完整画布快照 |
+| ConversationMessage | id, project_id, role, content, target_block, status, created_at | 微调指令与 AI 解释 |
+| ReviewSession | id, project_id, focus, status, current_round, report_json | 3 轮商业评审，不使用角色 |
+| ReviewRound | id, session_id, round_no, question, answer, risk_tag | 每轮问答 |
+| CompetitorScan | id, project_id, query, source, status, matrix_json | `source=web` 或 `mock` |
+
+版本规则：首次完整生成保存 v1；局部微调成功或用户确认应用建议时新建完整版本。无效输入、超时、JSON 校验失败、未确认建议不得写版本。
+
+## 3. API
+
+| Method | Path | 请求 | 返回 |
+|---|---|---|---|
+| POST | `/v1/projects` | title?, rawIdea | Project |
+| GET | `/v1/projects/{id}` | - | Project + latest CanvasVersion |
+| POST | `/v1/projects/{id}/generate` | industry?, audience? | SSE |
+| POST | `/v1/projects/{id}/refine` | instruction, targetHint? | RefineResult |
+| POST | `/v1/projects/{id}/review-sessions` | focus? | ReviewSession + round 1 |
+| POST | `/v1/review-sessions/{id}/answers` | answer | next question / ReviewReport |
+| POST | `/v1/projects/{id}/competitor-scans` | query? | CompetitorScan |
+| POST | `/v1/projects/{id}/suggestions/apply` | suggestionId, targetBlock | new CanvasVersion |
+
+### SSE events
+
+```text
+generation_started {projectId}
+block_delta {blockKey, delta}
+block_completed {blockKey, content}
+generation_completed {canvasVersion, status:"editable"}
+error {code, message}
+```
+
+## 4. AI 结构化输出
+
+### CanvasAgent
+
+输入：`rawIdea, industry?, audience?`。
+
+输出必须为 9 个 CanvasBlockKey；每格 `content` 约 30-120 个中文字符。未知信息使用“待验证假设”表达，不得编造成已验证事实；不输出 Markdown。
+
+### RefineAgent
+
+输入：当前完整画布、`instruction`、`targetHint?`。
+
+输出：`targetBlock, patches, relatedSuggestions, explanation, needsClarification`。
+
+- 默认只修改目标模块。
+- 无法定位时返回 `needsClarification=true` 和一个明确问题，不得返回 patch。
+
+```json
+{
+  "targetBlock": "revenue_streams",
+  "patches": [{"blockKey": "revenue_streams", "content": "学生会员订阅 + 单次服务"}],
+  "relatedSuggestions": [{"blockKey": "cost_structure", "reason": "需增加会员运营成本"}],
+  "needsClarification": false
+}
+```
+
+### ReviewAgent
+
+统一、专业的 AI 商业评审助手；不包含角色、人设、人物图片或角色化话术。
+
+维度：
+- 需求与用户
+- 价值与差异化
+- 盈利与成本
+- 渠道与竞争
+
+规则：共 3 轮问答，完成后输出 `riskItems, existingEvidence, nextValidationActions, suggestedPatches`。每个风险标注 `high/medium/low`。
+
+### CompetitorAgent
+
+真实搜索可用时：返回 `name, segment, strengths, limitations, sourceUrl, confidence`。
+
+搜索未配置时：返回 `source="mock"`，前端必须显示“演示数据，未联网检索”；不允许伪造真实竞品或来源。
+
+### 模型输出总规则
+
+- 所有输出先 Pydantic 校验，再写入 SQLite。
+- JSON 失败时可自动修复一次。
+- 第二次失败返回 `LLM_SCHEMA_INVALID`，不写库。
+
+## 5. 页面组件与状态机
+
+组件：`IdeaInputPanel`、`CanvasGrid`、`CanvasCard`、`ChatRefinePanel`、`ReviewPanel`、`CompetitorDrawer`、`Toast/StatusBar`。
+
+```text
+empty -> generating -> editable
+editable -> refining -> editable
+editable -> reviewing -> editable
+editable -> scanning -> result_open -> editable
+any transient state -> error -> previous_stable_state
+```
+
+- 生成中：九宫格逐步补全，微调入口禁用。
+- 微调中：目标格高亮，非目标格只读。
+- 评审中：九宫格只读；完成或退出后恢复编辑。
+- 竞品扫描中：结果抽屉须显示 `source=web` 或 `source=mock`。
+
+## 6. 异常处理
+
+| 场景 | 后端 | 前端 |
+|---|---|---|
+| 输入不合法 | 400，不建项目 | 请输入 10-500 字创业想法 |
+| 15 秒无 SSE 首包 | 关闭流，记录日志 | 模型响应超时，请重试 |
+| 45 秒未完成 | 不保存半成品 | 生成未完成，已保留原始想法 |
+| JSON 校验失败 | 修复 1 次，否则 502 | AI 返回格式异常，请重试 |
+| 微调目标不明确 | clarification，不写库 | 请说明要修改哪一格 |
+| 无 Search Key | 返回 mock | 当前展示演示数据，未联网检索 |
+| 数据库写入失败 | 回滚事务 | 保存失败，请重试 |
+
+## 7. 环境变量与运行
+
+```bash
+# backend/.env
+LLM_BASE_URL=https://<provider>/v1
+LLM_API_KEY=your_key
+LLM_MODEL=your_model_name
+DATABASE_URL=sqlite:///./data/leanmind.db
+SEARCH_API_KEY=
+CORS_ORIGINS=http://localhost:3000
+
+# frontend/.env.local
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+```
+
+```bash
+# frontend
+cd frontend && npm install && npm run dev
+
+# backend
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+## 8. 验收标准
+
+- AC-01：10-500 字可创建项目；不足 10 字不调后端。
+- AC-02：九宫格 9 格完整返回；保存 v1。
+- AC-03：自然语言能修改目标模块；版本号递增。
+- AC-04：生成、高亮、锁定、错误、恢复状态可观察。
+- AC-05：可完成 3 轮商业评审，获得风险、依据、验证动作。
+- AC-06：竞品矩阵来源明确；至少一条建议可写回画布。
+- AC-07：刷新后恢复最新画布。
+
+## 9. Coding Agent 实施指令
+
+```text
+根据《LeanMind AI 软件技术规格说明书（SPEC）V1.2》实现可本地运行的 monorepo。
+
+技术栈：Next.js App Router + TypeScript + TailwindCSS；FastAPI + Pydantic + SQLAlchemy + SQLite。
+
+优先完成：创建项目、SSE 九宫格生成、自然语言局部微调与版本保存、刷新恢复。之后完成统一 AI 商业压力测试（3 轮）和竞品扫描 mock fallback。
+
+强制规则：API Key 只在后端；所有 LLM 结果 Pydantic 校验；JSON 失败最多修复一次；mock 数据必须标记；不实现角色、人物图片、主题剧情、账号、支付、复杂 RAG、PDF 导出或生产级爬虫。
+
+交付：README、.env.example、数据库初始化、启动命令、至少一组 mock 数据和基础 API 测试。
+```
